@@ -34,8 +34,23 @@ export type Outcome =
  * A failed GET is handled like any other failure: it never falls through to a POST.
  */
 export async function processJob(job: JobRow, deps: WorkerDeps): Promise<Outcome> {
-  const { db, courier, now } = deps;
+  const { db, courier, config, now } = deps;
   const orderId = job.order_id;
+
+  // Only reachable through lease reclaims (each one counts as an attempt): the worker keeps
+  // dying on this job. Park it instead of crashing again. Reconciliation will still adopt it
+  // if the courier turns out to have the shipment.
+  if (job.attempts >= config.maxAttempts) {
+    return parked(db, {
+      jobId: job.id,
+      orderId,
+      attempts: job.attempts,
+      rateLimitHits: job.rate_limit_hits,
+      lastError: 'lease_expired',
+      now: now(),
+    });
+  }
+
   const order = getOrder(db, orderId);
 
   if (order?.status === 'shipped' && order.shipment_id) {
@@ -133,9 +148,14 @@ export async function processNextJob(deps: WorkerDeps): Promise<{ job: JobRow; o
 
 /**
  * Polls the jobs table, one job at a time. stop() lets the in-flight job finish first.
+ *
+ * A courier rate limit applies to our whole account, not to one order. So after a 429 the
+ * loop pauses ALL courier work until Retry-After, instead of moving on to the next job and
+ * hitting the limit again.
  */
 export function startWorker(deps: WorkerDeps) {
   let stopping = false;
+  let pausedUntil = 0;
   let wake: (() => void) | null = null;
 
   const sleep = (ms: number) =>
@@ -155,8 +175,17 @@ export function startWorker(deps: WorkerDeps) {
     log('info', 'worker.started', { pollMs: deps.config.workerPollMs });
     while (!stopping) {
       try {
+        const pauseMs = pausedUntil - deps.now();
+        if (pauseMs > 0) {
+          await sleep(pauseMs);
+          continue;
+        }
         const result = await processNextJob(deps);
         if (!result) await sleep(deps.config.workerPollMs);
+        else if (result.outcome.kind === 'rate_limited') {
+          pausedUntil = deps.now() + result.outcome.retryAfterMs;
+          log('info', 'worker.paused', { forMs: result.outcome.retryAfterMs, reason: 'courier rate limit' });
+        }
       } catch (err) {
         // e.g. SQLITE_BUSY: the job keeps its lease and is retried after it expires.
         log('error', 'worker.error', { error: String((err as Error)?.stack ?? err) });

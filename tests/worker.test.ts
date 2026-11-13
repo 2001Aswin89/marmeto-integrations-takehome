@@ -1,7 +1,8 @@
 import { describe, test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { getJob, getOrder } from '../src/repo.js';
-import { processNextJob } from '../src/worker.js';
+import { loadConfig } from '../src/config.js';
+import { claimNextJob, getJob, getOrder } from '../src/repo.js';
+import { processNextJob, startWorker } from '../src/worker.js';
 import { orderPayload, workerHarness } from './helpers.js';
 
 type Harness = Awaited<ReturnType<typeof workerHarness>>;
@@ -153,6 +154,79 @@ describe('T11 a failed GET never falls through to a POST', () => {
     const result = await processNextJob(h.deps);
     assert.deepEqual(result?.outcome.kind, 'retry');
     assert.equal(h.posts().length, 0);
+  });
+});
+
+describe('T12 crash recovery through leases', () => {
+  test('a job whose worker died is reclaimed after the lease, and the reclaim counts as an attempt', async () => {
+    h = await workerHarness({ force: 'ok' }, { leaseMs: 60_000 });
+    h.enqueue(1001);
+
+    const claimed = claimNextJob(h.db, h.clock.now(), h.config.leaseMs); // ...and then the worker "dies"
+    assert.equal(claimed?.status, 'in_progress');
+    assert.equal(claimNextJob(h.db, h.clock.now(), h.config.leaseMs), undefined, 'leased: nobody else gets it');
+
+    h.clock.advance(59_999);
+    assert.equal(claimNextJob(h.db, h.clock.now(), h.config.leaseMs), undefined, 'lease still live');
+    h.clock.advance(1);
+    const reclaimed = claimNextJob(h.db, h.clock.now(), h.config.leaseMs);
+    assert.equal(reclaimed?.id, claimed?.id);
+    assert.equal(reclaimed?.attempts, 1);
+    assert.equal(reclaimed?.last_error, 'lease_expired');
+  });
+
+  test('crash after a successful POST but before the DB write: the retry adopts, no duplicate', async () => {
+    h = await workerHarness({ force: 'ok' });
+    h.enqueue(1001);
+    claimNextJob(h.db, h.clock.now(), h.config.leaseMs);
+    await h.deps.courier.create({ reference: '1001', address: {}, items: [] }); // POST went through, then crash
+
+    h.clock.advance(h.config.leaseMs);
+    const result = await processNextJob(h.deps);
+    assert.equal(result?.outcome.kind, 'adopted');
+    assert.equal(h.shipmentsAtCourier().length, 1);
+    assert.equal(getOrder(h.db, '1001')?.status, 'shipped');
+  });
+
+  test('a job that keeps killing the worker is parked instead of looping forever', async () => {
+    h = await workerHarness({ force: 'ok' }, { maxAttempts: 2 });
+    h.enqueue(1001);
+    claimNextJob(h.db, h.clock.now(), h.config.leaseMs); // crash #1
+    h.clock.advance(h.config.leaseMs);
+    claimNextJob(h.db, h.clock.now(), h.config.leaseMs); // reclaimed (attempt 1), crash #2
+    h.clock.advance(h.config.leaseMs);
+
+    const result = await processNextJob(h.deps); // reclaimed (attempt 2 = MAX)
+    assert.deepEqual(result?.outcome, { kind: 'parked', reason: 'lease_expired' });
+    assert.equal(getJob(h.db, '1001')?.status, 'dead');
+    assert.equal(h.mock.requests.length, 0);
+  });
+
+  test('config refuses a lease shorter than 3 x the courier timeout', () => {
+    assert.throws(() => loadConfig({ COURIER_TIMEOUT_MS: '5000', LEASE_MS: '10000' }), /LEASE_MS/);
+    assert.equal(loadConfig({ COURIER_TIMEOUT_MS: '5000', LEASE_MS: '15000' }).leaseMs, 15_000);
+  });
+});
+
+describe('a 429 pauses all courier work', () => {
+  test('after a rate limit, the worker does not move on to the next ready job until Retry-After', async () => {
+    h = await workerHarness({ retryAfterSec: 1 }, { workerPollMs: 10 });
+    h.mock.script(['429', 'ok', 'ok']);
+    h.enqueue(1001);
+    h.enqueue(1002);
+
+    // Real clock here: this exercises the actual loop and its sleep.
+    const worker = startWorker({ ...h.deps, now: Date.now });
+    try {
+      await new Promise((r) => setTimeout(r, 400));
+      assert.equal(h.posts().length, 1, 'order 1002 was ready but the worker is paused');
+      await new Promise((r) => setTimeout(r, 1000));
+      assert.equal(h.posts().length, 3, 'after Retry-After both orders go through');
+    } finally {
+      await worker.stop();
+    }
+    assert.equal(getOrder(h.db, '1001')?.status, 'shipped');
+    assert.equal(getOrder(h.db, '1002')?.status, 'shipped');
   });
 });
 
