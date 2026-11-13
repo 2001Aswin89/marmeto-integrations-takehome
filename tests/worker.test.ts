@@ -1,7 +1,7 @@
 import { describe, test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadConfig } from '../src/config.js';
-import { claimNextJob, getJob, getOrder } from '../src/repo.js';
+import { claimNextJob, getJob, getOrder, listFailed, replayJob } from '../src/repo.js';
 import { processNextJob, startWorker } from '../src/worker.js';
 import { orderPayload, workerHarness } from './helpers.js';
 
@@ -128,6 +128,43 @@ describe('T7 500 on every call', () => {
     h.clock.advance(3_600_000);
     assert.equal(await processNextJob(h.deps), null, 'parked jobs are not picked up again');
     assert.equal(h.shipmentsAtCourier().length, 0);
+
+    // Visible...
+    assert.deepEqual(
+      listFailed(h.db).map((f) => [f.order_id, f.last_error, f.attempts]),
+      [['1001', 'server_error', 5]],
+    );
+    // ...and replayable: a fresh start, then the courier recovers.
+    assert.equal(replayJob(h.db, '1001', h.clock.now()), 'replayed');
+    const replayed = getJob(h.db, '1001');
+    assert.equal(replayed?.status, 'queued');
+    assert.equal(replayed?.attempts, 0);
+    assert.equal(getOrder(h.db, '1001')?.status, 'pending');
+
+    h.mock.script(['ok']); // scripted outcomes take precedence over the forced 500
+    assert.equal((await processNextJob(h.deps))?.outcome.kind, 'shipped');
+    assert.equal(getOrder(h.db, '1001')?.status, 'shipped');
+    assert.equal(h.shipmentsAtCourier().length, 1, 'exactly one shipment after replay');
+    assert.deepEqual(listFailed(h.db), []);
+  });
+
+  test('replaying after the courier did create it (parked after timeouts) adopts instead of re-posting', async () => {
+    h = await workerHarness({ force: 'hang' }, { maxAttempts: 1 });
+    h.enqueue(1001);
+    assert.deepEqual((await processNextJob(h.deps))?.outcome, { kind: 'parked', reason: 'timeout' });
+    assert.equal(replayJob(h.db, '1001', h.clock.now()), 'replayed');
+    assert.equal((await processNextJob(h.deps))?.outcome.kind, 'adopted');
+    assert.equal(h.shipmentsAtCourier().length, 1);
+  });
+
+  test('replay only touches parked jobs', async () => {
+    h = await workerHarness({ force: 'ok' });
+    assert.equal(replayJob(h.db, 'nope', h.clock.now()), 'not_found');
+    h.enqueue(1001);
+    assert.equal(replayJob(h.db, '1001', h.clock.now()), 'not_parked');
+    await processNextJob(h.deps);
+    assert.equal(replayJob(h.db, '1001', h.clock.now()), 'already_shipped');
+    assert.equal(h.shipmentsAtCourier().length, 1);
   });
 });
 
