@@ -185,6 +185,52 @@ export function replayJob(db: Db, orderId: string, now: number): ReplayResult {
   })();
 }
 
+/**
+ * Reconciliation found the shipment at the courier: confirm it, unless the worker holds a live
+ * lease on the job right now (then the worker's own check will find the same shipment).
+ * Returns false if nothing changed.
+ */
+export function adoptShipment(
+  db: Db,
+  input: { orderId: string; shipmentId: string; duplicates: number; now: number },
+): boolean {
+  return db.transaction((): boolean => {
+    const changed = db
+      .prepare(
+        `UPDATE jobs SET status = 'done', locked_until = NULL, updated_at = @now
+         WHERE order_id = @orderId AND status != 'done'
+           AND NOT (status = 'in_progress' AND locked_until > @now)`,
+      )
+      .run(input).changes;
+    if (changed === 0) return false;
+    db.prepare(
+      `UPDATE orders SET status = 'shipped', shipment_id = @shipmentId, duplicate_shipments = @duplicates,
+         updated_at = @now
+       WHERE order_id = @orderId`,
+    ).run(input);
+    return true;
+  })();
+}
+
+/**
+ * Reconciliation's automatic retry of a parked job: a fresh attempt budget, and one more on the
+ * reconcile_requeues counter (which caps how often this can happen). Only if still 'dead'.
+ */
+export function requeueParked(db: Db, orderId: string, now: number): boolean {
+  return db.transaction((): boolean => {
+    const changed = db
+      .prepare(
+        `UPDATE jobs SET status = 'queued', attempts = 0, rate_limit_hits = 0,
+           reconcile_requeues = reconcile_requeues + 1, run_at = @now, locked_until = NULL, updated_at = @now
+         WHERE order_id = @orderId AND status = 'dead'`,
+      )
+      .run({ orderId, now }).changes;
+    if (changed === 0) return false;
+    db.prepare(`UPDATE orders SET status = 'pending', updated_at = ? WHERE order_id = ?`).run(now, orderId);
+    return true;
+  })();
+}
+
 export function getOrder(db: Db, orderId: string): OrderRow | undefined {
   return db.prepare('SELECT * FROM orders WHERE order_id = ?').get(orderId) as OrderRow | undefined;
 }
