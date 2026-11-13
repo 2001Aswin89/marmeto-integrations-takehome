@@ -140,6 +140,51 @@ export function park(
   })();
 }
 
+export interface FailedJob {
+  order_id: string;
+  attempts: number;
+  rate_limit_hits: number;
+  reconcile_requeues: number;
+  last_error: string | null;
+  updated_at: number;
+}
+
+/** Parked (dead-lettered) jobs, oldest first. */
+export function listFailed(db: Db): FailedJob[] {
+  return db
+    .prepare(
+      `SELECT order_id, attempts, rate_limit_hits, reconcile_requeues, last_error, updated_at
+       FROM jobs WHERE status = 'dead' ORDER BY updated_at, id`,
+    )
+    .all() as FailedJob[];
+}
+
+export type ReplayResult = 'replayed' | 'not_found' | 'already_shipped' | 'not_parked';
+
+/**
+ * Human replay of a parked job: a fresh start (counters reset), back to the queue now.
+ * Only touches a job that is still 'dead' (conditional UPDATE), so it can't disturb a job
+ * the worker or reconciliation is handling. Safe because the worker checks the courier first.
+ */
+export function replayJob(db: Db, orderId: string, now: number): ReplayResult {
+  return db.transaction((): ReplayResult => {
+    const changed = db
+      .prepare(
+        `UPDATE jobs SET status = 'queued', attempts = 0, rate_limit_hits = 0, reconcile_requeues = 0,
+           run_at = @now, locked_until = NULL, last_error = NULL, updated_at = @now
+         WHERE order_id = @orderId AND status = 'dead'`,
+      )
+      .run({ orderId, now }).changes;
+    if (changed === 1) {
+      db.prepare(`UPDATE orders SET status = 'pending', updated_at = ? WHERE order_id = ?`).run(now, orderId);
+      return 'replayed';
+    }
+    const job = getJob(db, orderId);
+    if (!job) return 'not_found';
+    return job.status === 'done' ? 'already_shipped' : 'not_parked';
+  })();
+}
+
 export function getOrder(db: Db, orderId: string): OrderRow | undefined {
   return db.prepare('SELECT * FROM orders WHERE order_id = ?').get(orderId) as OrderRow | undefined;
 }

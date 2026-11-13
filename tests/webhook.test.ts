@@ -142,6 +142,19 @@ describe('T4 same order under a different webhook id', () => {
   });
 });
 
+describe('GET /orders/:orderId', () => {
+  test('shows the order and its job; 404 for unknown orders', async () => {
+    const t = fresh();
+    await signedPost(t.app, body);
+    const res = await request(t.app).get('/orders/1001');
+    assert.equal(res.status, 200);
+    assert.equal(res.body.status, 'pending');
+    assert.equal(res.body.job.status, 'queued');
+    assert.equal(res.body.job.attempts, 0);
+    assert.equal((await request(t.app).get('/orders/nope')).status, 404);
+  });
+});
+
 describe('T10 the webhook responds fast and never calls the courier', () => {
   test('replies 200 with a queued job and zero courier requests', async () => {
     const courier = await startMock();

@@ -1,6 +1,7 @@
 import express, { type ErrorRequestHandler } from 'express';
 import type { Config } from './config.js';
 import type { Db } from './db.js';
+import { ordersRouter } from './http/orders.js';
 import { webhookRouter } from './http/webhook.js';
 import { log } from './lib/log.js';
 
@@ -17,6 +18,7 @@ export function createApp({ config, db, now = Date.now }: AppDeps) {
 
   // Deliberately no global body parser: the webhook route needs the raw bytes.
   app.use(webhookRouter({ config, db, now }));
+  app.use(ordersRouter({ db }));
 
   const onError: ErrorRequestHandler = (err, _req, res, _next) => {
     const status = Number(err?.status ?? err?.statusCode ?? 500);
