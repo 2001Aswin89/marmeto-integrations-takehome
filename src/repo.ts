@@ -66,6 +66,72 @@ export function ingestWebhook(
   })();
 }
 
+/**
+ * Atomically claims the next ready job and leases it for `leaseMs`. A job whose lease has
+ * expired (the worker died mid-job) is claimable again. One statement, so two claimers can
+ * never get the same job.
+ */
+export function claimNextJob(db: Db, now: number, leaseMs: number): JobRow | undefined {
+  return db
+    .prepare(
+      `UPDATE jobs SET status = 'in_progress', locked_until = @lockedUntil, updated_at = @now
+       WHERE id = (
+         SELECT id FROM jobs
+         WHERE (status = 'queued' AND run_at <= @now)
+            OR (status = 'in_progress' AND locked_until <= @now)
+         ORDER BY run_at, id
+         LIMIT 1
+       )
+       RETURNING *`,
+    )
+    .get({ now, lockedUntil: now + leaseMs }) as JobRow | undefined;
+}
+
+/** Order -> shipped and job -> done, together (invariant: shipped <=> done). */
+export function markShipped(
+  db: Db,
+  input: { orderId: string; shipmentId: string; duplicates: number; now: number },
+): void {
+  const { orderId, shipmentId, duplicates, now } = input;
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE orders SET status = 'shipped', shipment_id = ?, duplicate_shipments = ?, updated_at = ?
+       WHERE order_id = ?`,
+    ).run(shipmentId, duplicates, now, orderId);
+    db.prepare(`UPDATE jobs SET status = 'done', locked_until = NULL, updated_at = ? WHERE order_id = ?`).run(
+      now,
+      orderId,
+    );
+  })();
+}
+
+/** Puts a claimed job back in the queue for a later attempt. */
+export function retryLater(
+  db: Db,
+  input: { jobId: number; runAt: number; attempts: number; rateLimitHits: number; lastError: string; now: number },
+): void {
+  db.prepare(
+    `UPDATE jobs SET status = 'queued', locked_until = NULL, run_at = @runAt, attempts = @attempts,
+       rate_limit_hits = @rateLimitHits, last_error = @lastError, updated_at = @now
+     WHERE id = @jobId`,
+  ).run(input);
+}
+
+/** Parks a job (dead-letter): job -> dead, order -> failed. Visible via `npm run failed`, replayable. */
+export function park(
+  db: Db,
+  input: { jobId: number; orderId: string; attempts: number; rateLimitHits: number; lastError: string; now: number },
+): void {
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE jobs SET status = 'dead', locked_until = NULL, attempts = @attempts,
+         rate_limit_hits = @rateLimitHits, last_error = @lastError, updated_at = @now
+       WHERE id = @jobId`,
+    ).run(input);
+    db.prepare(`UPDATE orders SET status = 'failed', updated_at = @now WHERE order_id = @orderId`).run(input);
+  })();
+}
+
 export function getOrder(db: Db, orderId: string): OrderRow | undefined {
   return db.prepare('SELECT * FROM orders WHERE order_id = ?').get(orderId) as OrderRow | undefined;
 }
