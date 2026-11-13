@@ -2,6 +2,7 @@ import request from 'supertest';
 import type { Express } from 'express';
 import { createMockCourier } from '../mock-courier.js';
 import { loadConfig, type Config } from '../src/config.js';
+import type { Db } from '../src/db.js';
 import { sign } from '../src/lib/hmac.js';
 
 process.env.LOG_LEVEL ??= 'silent';
@@ -42,6 +43,12 @@ export function orderPayload(id: number | string = 1001, extra: Record<string, u
     ],
     ...extra,
   };
+}
+
+/** Row counts of the three tables. */
+export function counts(db: Db) {
+  const n = (table: string) => (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+  return { webhook_events: n('webhook_events'), orders: n('orders'), jobs: n('jobs') };
 }
 
 /** Sends a correctly signed webhook. `body` is sent byte-for-byte as given. */

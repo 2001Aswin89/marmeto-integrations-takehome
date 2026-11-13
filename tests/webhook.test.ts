@@ -2,11 +2,20 @@ import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import request from 'supertest';
 import { createApp } from '../src/app.js';
+import { openDb } from '../src/db.js';
 import { sign, verify } from '../src/lib/hmac.js';
-import { orderPayload, signedPost, testConfig, TEST_SECRET } from './helpers.js';
+import { getJob, getOrder } from '../src/repo.js';
+import { counts, orderPayload, signedPost, startMock, testConfig, TEST_SECRET } from './helpers.js';
 
-const app = createApp({ config: testConfig() });
+const db = openDb(':memory:');
+const app = createApp({ config: testConfig(), db });
 const body = JSON.stringify(orderPayload(1001));
+
+/** A fresh app + empty DB per test, for the idempotency checks. */
+function fresh() {
+  const db = openDb(':memory:');
+  return { db, app: createApp({ config: testConfig(), db }) };
+}
 
 describe('T1 signature verification', () => {
   test('a valid signature is accepted', async () => {
@@ -15,12 +24,14 @@ describe('T1 signature verification', () => {
     assert.equal(res.body.ok, true);
   });
 
-  test('a tampered body is rejected with 401', async () => {
+  test('a tampered body is rejected with 401 and nothing is stored', async () => {
+    const t = fresh();
     const signature = sign(TEST_SECRET, body);
     const tampered = body.replace('"quantity":2', '"quantity":20');
-    const res = await signedPost(app, tampered, { signature });
+    const res = await signedPost(t.app, tampered, { signature });
     assert.equal(res.status, 401);
     assert.deepEqual(res.body, { error: 'invalid signature' });
+    assert.deepEqual(counts(t.db), { webhook_events: 0, orders: 0, jobs: 0 });
   });
 
   test('a signature made with the wrong secret is rejected', async () => {
@@ -90,5 +101,62 @@ describe('payload checks after a valid signature', () => {
     const big = JSON.stringify({ id: 1, pad: 'x'.repeat(1_100_000) });
     const res = await signedPost(app, big);
     assert.equal(res.status, 413);
+  });
+});
+
+describe('T3 same webhook delivered twice', () => {
+  test('creates one order and one job; the repeat is acknowledged as a duplicate', async () => {
+    const t = fresh();
+    const first = await signedPost(t.app, body, { webhookId: 'wh_1' });
+    const second = await signedPost(t.app, body, { webhookId: 'wh_1' });
+    assert.deepEqual(first.body, { ok: true, duplicate: false });
+    assert.equal(second.status, 200, 'a duplicate must be 2xx or the store keeps retrying');
+    assert.deepEqual(second.body, { ok: true, duplicate: 'webhook' });
+    assert.deepEqual(counts(t.db), { webhook_events: 1, orders: 1, jobs: 1 });
+
+    const order = getOrder(t.db, '1001');
+    assert.equal(order?.status, 'pending');
+    assert.equal(order?.payload, body, 'the raw body is stored as received');
+    assert.equal(getJob(t.db, '1001')?.status, 'queued');
+  });
+});
+
+describe('T4 same order under a different webhook id', () => {
+  test('number and string ids are the same order: one order, one job', async () => {
+    const t = fresh();
+    const first = await signedPost(t.app, JSON.stringify(orderPayload(1001)), { webhookId: 'wh_1' });
+    const second = await signedPost(t.app, JSON.stringify(orderPayload('1001')), { webhookId: 'wh_2' });
+    assert.equal(first.body.duplicate, false);
+    assert.equal(second.body.duplicate, 'order');
+    // Both deliveries are recorded; only one order/job exists.
+    assert.deepEqual(counts(t.db), { webhook_events: 2, orders: 1, jobs: 1 });
+  });
+
+  test('without X-Shop-Webhook-Id the order id still prevents a second job', async () => {
+    const t = fresh();
+    const first = await signedPost(t.app, body, { webhookId: null });
+    const second = await signedPost(t.app, body, { webhookId: null });
+    assert.equal(first.body.duplicate, false);
+    assert.equal(second.body.duplicate, 'order');
+    assert.deepEqual(counts(t.db), { webhook_events: 0, orders: 1, jobs: 1 });
+  });
+});
+
+describe('T10 the webhook responds fast and never calls the courier', () => {
+  test('replies 200 with a queued job and zero courier requests', async () => {
+    const courier = await startMock();
+    try {
+      const db = openDb(':memory:');
+      const fastApp = createApp({ config: testConfig({ courierBaseUrl: courier.url }), db });
+      const started = performance.now();
+      const res = await signedPost(fastApp, body);
+      const ms = performance.now() - started;
+      assert.equal(res.status, 200);
+      assert.equal(getJob(db, '1001')?.status, 'queued');
+      assert.equal(courier.mock.requests.length, 0, 'no courier call in the request path');
+      assert.ok(ms < 1000, `took ${ms.toFixed(1)}ms`);
+    } finally {
+      await courier.close();
+    }
   });
 });
