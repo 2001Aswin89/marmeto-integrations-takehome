@@ -70,11 +70,19 @@ export function ingestWebhook(
  * Atomically claims the next ready job and leases it for `leaseMs`. A job whose lease has
  * expired (the worker died mid-job) is claimable again. One statement, so two claimers can
  * never get the same job.
+ *
+ * Reclaiming an expired lease counts as a failed attempt: otherwise a payload that crashes
+ * the worker every time would be retried forever instead of being parked.
  */
 export function claimNextJob(db: Db, now: number, leaseMs: number): JobRow | undefined {
   return db
     .prepare(
-      `UPDATE jobs SET status = 'in_progress', locked_until = @lockedUntil, updated_at = @now
+      `UPDATE jobs SET
+         status       = 'in_progress',
+         locked_until = @lockedUntil,
+         attempts     = attempts + CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END,
+         last_error   = CASE WHEN status = 'in_progress' THEN 'lease_expired' ELSE last_error END,
+         updated_at   = @now
        WHERE id = (
          SELECT id FROM jobs
          WHERE (status = 'queued' AND run_at <= @now)
