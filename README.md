@@ -17,7 +17,7 @@ store ──signed POST──▶ /webhooks/orders-create ──1 transaction─�
 
 ## Quick start
 
-Needs Node.js 20+ (built and tested on Node 22, Windows 11).
+Needs **Node.js 22.13+** (built and tested on Node 22.15, Windows 11). There are no native modules, so nothing is compiled during install.
 
 ```bash
 npm install
@@ -253,9 +253,9 @@ The worker is driven one job at a time with an injected clock, so no test waits 
 
 ### Notes on tooling
 
-- **SQLite via `better-sqlite3`:** synchronous, real transactions, `RETURNING`, and prebuilt binaries for Windows.
+- **SQLite via Node's built-in `node:sqlite`:** synchronous, real transactions and `RETURNING`, with nothing to compile. I started with `better-sqlite3`, but checking from a fresh clone showed that `npm install` tried to rebuild it with `node-gyp` on Windows and failed without Visual Studio's C++ tools. That would break the one-command run for some reviewers, so I switched (see the `fix:` commit). Node 22 labels `node:sqlite` experimental, and the npm scripts hide that one warning.
 - **Express 5** (it forwards errors from async handlers itself).
-- **Node's built-in `node:test`** instead of vitest or jest: one less dependency, and plenty for these tests. TypeScript runs through `tsx`, so there's no build step.
+- **Node's built-in `node:test`** instead of vitest or jest: one less dependency, and plenty for these tests. TypeScript runs through `tsx`, so there's no build step. Runtime dependencies: `express` and `dotenv`.
 
 ## Repository layout
 
