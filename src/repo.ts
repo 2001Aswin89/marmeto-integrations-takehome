@@ -1,0 +1,242 @@
+import { transaction, type Db } from './db.js';
+
+export type OrderStatus = 'pending' | 'shipped' | 'failed';
+export type JobStatus = 'queued' | 'in_progress' | 'done' | 'dead';
+
+export interface OrderRow {
+  order_id: string;
+  payload: string;
+  status: OrderStatus;
+  shipment_id: string | null;
+  duplicate_shipments: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface JobRow {
+  id: number;
+  order_id: string;
+  status: JobStatus;
+  attempts: number;
+  rate_limit_hits: number;
+  reconcile_requeues: number;
+  run_at: number;
+  locked_until: number | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export type Duplicate = false | 'webhook' | 'order';
+
+/**
+ * Records the webhook, the order and its job in ONE transaction, so an order we said
+ * 200 to always has a job (no lost work if we crash right after replying).
+ *
+ * Two idempotency layers:
+ *  - same X-Shop-Webhook-Id   -> webhook_events primary key -> 'webhook'
+ *  - same order, new webhook  -> orders primary key         -> 'order'
+ */
+export function ingestWebhook(
+  db: Db,
+  input: { webhookId: string | null; orderId: string; rawBody: string; now: number },
+): Duplicate {
+  const { webhookId, orderId, rawBody, now } = input;
+  return transaction(db, (): Duplicate => {
+    if (webhookId !== null) {
+      const event = db
+        .prepare('INSERT OR IGNORE INTO webhook_events (webhook_id, order_id, received_at) VALUES (?, ?, ?)')
+        .run(webhookId, orderId, now);
+      if (event.changes === 0) return 'webhook';
+    }
+
+    const order = db
+      .prepare(
+        `INSERT OR IGNORE INTO orders (order_id, payload, status, created_at, updated_at)
+         VALUES (?, ?, 'pending', ?, ?)`,
+      )
+      .run(orderId, rawBody, now, now);
+    if (order.changes === 0) return 'order';
+
+    db.prepare(
+      `INSERT INTO jobs (order_id, status, run_at, created_at, updated_at)
+       VALUES (?, 'queued', ?, ?, ?)`,
+    ).run(orderId, now, now, now);
+    return false;
+  });
+}
+
+/**
+ * Atomically claims the next ready job and leases it for `leaseMs`. A job whose lease has
+ * expired (the worker died mid-job) is claimable again. One statement, so two claimers can
+ * never get the same job.
+ *
+ * Reclaiming an expired lease counts as a failed attempt: otherwise a payload that crashes
+ * the worker every time would be retried forever instead of being parked.
+ */
+export function claimNextJob(db: Db, now: number, leaseMs: number): JobRow | undefined {
+  return db
+    .prepare(
+      `UPDATE jobs SET
+         status       = 'in_progress',
+         locked_until = @lockedUntil,
+         attempts     = attempts + CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END,
+         last_error   = CASE WHEN status = 'in_progress' THEN 'lease_expired' ELSE last_error END,
+         updated_at   = @now
+       WHERE id = (
+         SELECT id FROM jobs
+         WHERE (status = 'queued' AND run_at <= @now)
+            OR (status = 'in_progress' AND locked_until <= @now)
+         ORDER BY run_at, id
+         LIMIT 1
+       )
+       RETURNING *`,
+    )
+    .get({ now, lockedUntil: now + leaseMs }) as JobRow | undefined;
+}
+
+/** Order -> shipped and job -> done, together (invariant: shipped <=> done). */
+export function markShipped(
+  db: Db,
+  input: { orderId: string; shipmentId: string; duplicates: number; now: number },
+): void {
+  const { orderId, shipmentId, duplicates, now } = input;
+  transaction(db, () => {
+    db.prepare(
+      `UPDATE orders SET status = 'shipped', shipment_id = ?, duplicate_shipments = ?, updated_at = ?
+       WHERE order_id = ?`,
+    ).run(shipmentId, duplicates, now, orderId);
+    db.prepare(`UPDATE jobs SET status = 'done', locked_until = NULL, updated_at = ? WHERE order_id = ?`).run(
+      now,
+      orderId,
+    );
+  });
+}
+
+/** Puts a claimed job back in the queue for a later attempt. */
+export function retryLater(
+  db: Db,
+  input: { jobId: number; runAt: number; attempts: number; rateLimitHits: number; lastError: string; now: number },
+): void {
+  const { jobId, runAt, attempts, rateLimitHits, lastError, now } = input; // bind exactly what the SQL uses
+  db.prepare(
+    `UPDATE jobs SET status = 'queued', locked_until = NULL, run_at = @runAt, attempts = @attempts,
+       rate_limit_hits = @rateLimitHits, last_error = @lastError, updated_at = @now
+     WHERE id = @jobId`,
+  ).run({ jobId, runAt, attempts, rateLimitHits, lastError, now });
+}
+
+/** Parks a job (dead-letter): job -> dead, order -> failed. Visible via `npm run failed`, replayable. */
+export function park(
+  db: Db,
+  input: { jobId: number; orderId: string; attempts: number; rateLimitHits: number; lastError: string; now: number },
+): void {
+  const { jobId, orderId, attempts, rateLimitHits, lastError, now } = input;
+  transaction(db, () => {
+    db.prepare(
+      `UPDATE jobs SET status = 'dead', locked_until = NULL, attempts = @attempts,
+         rate_limit_hits = @rateLimitHits, last_error = @lastError, updated_at = @now
+       WHERE id = @jobId`,
+    ).run({ jobId, attempts, rateLimitHits, lastError, now });
+    db.prepare(`UPDATE orders SET status = 'failed', updated_at = ? WHERE order_id = ?`).run(now, orderId);
+  });
+}
+
+export interface FailedJob {
+  order_id: string;
+  attempts: number;
+  rate_limit_hits: number;
+  reconcile_requeues: number;
+  last_error: string | null;
+  updated_at: number;
+}
+
+/** Parked (dead-lettered) jobs, oldest first. */
+export function listFailed(db: Db): FailedJob[] {
+  return db
+    .prepare(
+      `SELECT order_id, attempts, rate_limit_hits, reconcile_requeues, last_error, updated_at
+       FROM jobs WHERE status = 'dead' ORDER BY updated_at, id`,
+    )
+    .all() as unknown as FailedJob[];
+}
+
+export type ReplayResult = 'replayed' | 'not_found' | 'already_shipped' | 'not_parked';
+
+/**
+ * Human replay of a parked job: a fresh start (counters reset), back to the queue now.
+ * Only touches a job that is still 'dead' (conditional UPDATE), so it can't disturb a job
+ * the worker or reconciliation is handling. Safe because the worker checks the courier first.
+ */
+export function replayJob(db: Db, orderId: string, now: number): ReplayResult {
+  return transaction(db, (): ReplayResult => {
+    const changed = db
+      .prepare(
+        `UPDATE jobs SET status = 'queued', attempts = 0, rate_limit_hits = 0, reconcile_requeues = 0,
+           run_at = @now, locked_until = NULL, last_error = NULL, updated_at = @now
+         WHERE order_id = @orderId AND status = 'dead'`,
+      )
+      .run({ orderId, now }).changes;
+    if (changed === 1) {
+      db.prepare(`UPDATE orders SET status = 'pending', updated_at = ? WHERE order_id = ?`).run(now, orderId);
+      return 'replayed';
+    }
+    const job = getJob(db, orderId);
+    if (!job) return 'not_found';
+    return job.status === 'done' ? 'already_shipped' : 'not_parked';
+  });
+}
+
+/**
+ * Reconciliation found the shipment at the courier: confirm it, unless the worker holds a live
+ * lease on the job right now (then the worker's own check will find the same shipment).
+ * Returns false if nothing changed.
+ */
+export function adoptShipment(
+  db: Db,
+  input: { orderId: string; shipmentId: string; duplicates: number; now: number },
+): boolean {
+  return transaction(db, (): boolean => {
+    const changed = db
+      .prepare(
+        `UPDATE jobs SET status = 'done', locked_until = NULL, updated_at = @now
+         WHERE order_id = @orderId AND status != 'done'
+           AND NOT (status = 'in_progress' AND locked_until > @now)`,
+      )
+      .run({ orderId: input.orderId, now: input.now }).changes;
+    if (changed === 0) return false;
+    db.prepare(
+      `UPDATE orders SET status = 'shipped', shipment_id = @shipmentId, duplicate_shipments = @duplicates,
+         updated_at = @now
+       WHERE order_id = @orderId`,
+    ).run(input);
+    return true;
+  });
+}
+
+/**
+ * Reconciliation's automatic retry of a parked job: a fresh attempt budget, and one more on the
+ * reconcile_requeues counter (which caps how often this can happen). Only if still 'dead'.
+ */
+export function requeueParked(db: Db, orderId: string, now: number): boolean {
+  return transaction(db, (): boolean => {
+    const changed = db
+      .prepare(
+        `UPDATE jobs SET status = 'queued', attempts = 0, rate_limit_hits = 0,
+           reconcile_requeues = reconcile_requeues + 1, run_at = @now, locked_until = NULL, updated_at = @now
+         WHERE order_id = @orderId AND status = 'dead'`,
+      )
+      .run({ orderId, now }).changes;
+    if (changed === 0) return false;
+    db.prepare(`UPDATE orders SET status = 'pending', updated_at = ? WHERE order_id = ?`).run(now, orderId);
+    return true;
+  });
+}
+
+export function getOrder(db: Db, orderId: string): OrderRow | undefined {
+  return db.prepare('SELECT * FROM orders WHERE order_id = ?').get(orderId) as OrderRow | undefined;
+}
+
+export function getJob(db: Db, orderId: string): JobRow | undefined {
+  return db.prepare('SELECT * FROM jobs WHERE order_id = ?').get(orderId) as JobRow | undefined;
+}
