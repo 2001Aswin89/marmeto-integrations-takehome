@@ -1,10 +1,14 @@
 import express, { Router } from 'express';
 import type { Config } from '../config.js';
+import type { Db } from '../db.js';
 import { verify } from '../lib/hmac.js';
 import { log } from '../lib/log.js';
+import { ingestWebhook } from '../repo.js';
 
 export interface WebhookDeps {
   config: Config;
+  db: Db;
+  now: () => number;
 }
 
 /** Returns the order id as a string, or null if it is missing or unusable as a key. */
@@ -15,7 +19,7 @@ export function parseOrderId(id: unknown): string | null {
   return null;
 }
 
-export function webhookRouter({ config }: WebhookDeps): Router {
+export function webhookRouter({ config, db, now }: WebhookDeps): Router {
   const router = Router();
 
   router.post(
@@ -33,9 +37,10 @@ export function webhookRouter({ config }: WebhookDeps): Router {
         return;
       }
 
+      const text = rawBody.toString('utf8');
       let payload: { id?: unknown };
       try {
-        payload = JSON.parse(rawBody.toString('utf8'));
+        payload = JSON.parse(text);
       } catch {
         res.status(400).json({ error: 'invalid json' });
         return;
@@ -49,11 +54,14 @@ export function webhookRouter({ config }: WebhookDeps): Router {
 
       const webhookId = req.get('X-Shop-Webhook-Id')?.trim() || null;
       if (webhookId === null) {
+        // Still safe: the order id is the second idempotency key.
         log('warn', 'webhook.missing_webhook_id', { orderId });
       }
 
-      log('info', 'webhook.received', { orderId, webhookId, ms: Date.now() - started });
-      res.status(200).json({ ok: true });
+      // No courier call here: the worker picks the job up. Duplicates are a 200 so the store stops retrying.
+      const duplicate = ingestWebhook(db, { webhookId, orderId, rawBody: text, now: now() });
+      log('info', 'webhook.received', { orderId, webhookId, duplicate, ms: Date.now() - started });
+      res.status(200).json({ ok: true, duplicate });
     },
   );
 
