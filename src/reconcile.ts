@@ -58,7 +58,7 @@ export async function reconcile(
          AND NOT (j.status = 'in_progress' AND j.locked_until > @now)
        ORDER BY o.created_at, o.order_id`,
     )
-    .all({ cutoff: startedAt - minAgeMs, now: startedAt }) as Candidate[];
+    .all({ cutoff: startedAt - minAgeMs, now: startedAt }) as unknown as Candidate[];
 
   const result: ReconcileResult = {
     summary: { checked: 0, adopted: 0, requeued: 0, needs_attention: 0, in_flight: 0, errored: 0 },
