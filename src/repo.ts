@@ -1,4 +1,4 @@
-import type { Db } from './db.js';
+import { transaction, type Db } from './db.js';
 
 export type OrderStatus = 'pending' | 'shipped' | 'failed';
 export type JobStatus = 'queued' | 'in_progress' | 'done' | 'dead';
@@ -42,7 +42,7 @@ export function ingestWebhook(
   input: { webhookId: string | null; orderId: string; rawBody: string; now: number },
 ): Duplicate {
   const { webhookId, orderId, rawBody, now } = input;
-  return db.transaction((): Duplicate => {
+  return transaction(db, (): Duplicate => {
     if (webhookId !== null) {
       const event = db
         .prepare('INSERT OR IGNORE INTO webhook_events (webhook_id, order_id, received_at) VALUES (?, ?, ?)')
@@ -63,7 +63,7 @@ export function ingestWebhook(
        VALUES (?, 'queued', ?, ?, ?)`,
     ).run(orderId, now, now, now);
     return false;
-  })();
+  });
 }
 
 /**
@@ -101,7 +101,7 @@ export function markShipped(
   input: { orderId: string; shipmentId: string; duplicates: number; now: number },
 ): void {
   const { orderId, shipmentId, duplicates, now } = input;
-  db.transaction(() => {
+  transaction(db, () => {
     db.prepare(
       `UPDATE orders SET status = 'shipped', shipment_id = ?, duplicate_shipments = ?, updated_at = ?
        WHERE order_id = ?`,
@@ -110,7 +110,7 @@ export function markShipped(
       now,
       orderId,
     );
-  })();
+  });
 }
 
 /** Puts a claimed job back in the queue for a later attempt. */
@@ -118,11 +118,12 @@ export function retryLater(
   db: Db,
   input: { jobId: number; runAt: number; attempts: number; rateLimitHits: number; lastError: string; now: number },
 ): void {
+  const { jobId, runAt, attempts, rateLimitHits, lastError, now } = input; // bind exactly what the SQL uses
   db.prepare(
     `UPDATE jobs SET status = 'queued', locked_until = NULL, run_at = @runAt, attempts = @attempts,
        rate_limit_hits = @rateLimitHits, last_error = @lastError, updated_at = @now
      WHERE id = @jobId`,
-  ).run(input);
+  ).run({ jobId, runAt, attempts, rateLimitHits, lastError, now });
 }
 
 /** Parks a job (dead-letter): job -> dead, order -> failed. Visible via `npm run failed`, replayable. */
@@ -130,14 +131,15 @@ export function park(
   db: Db,
   input: { jobId: number; orderId: string; attempts: number; rateLimitHits: number; lastError: string; now: number },
 ): void {
-  db.transaction(() => {
+  const { jobId, orderId, attempts, rateLimitHits, lastError, now } = input;
+  transaction(db, () => {
     db.prepare(
       `UPDATE jobs SET status = 'dead', locked_until = NULL, attempts = @attempts,
          rate_limit_hits = @rateLimitHits, last_error = @lastError, updated_at = @now
        WHERE id = @jobId`,
-    ).run(input);
-    db.prepare(`UPDATE orders SET status = 'failed', updated_at = @now WHERE order_id = @orderId`).run(input);
-  })();
+    ).run({ jobId, attempts, rateLimitHits, lastError, now });
+    db.prepare(`UPDATE orders SET status = 'failed', updated_at = ? WHERE order_id = ?`).run(now, orderId);
+  });
 }
 
 export interface FailedJob {
@@ -156,7 +158,7 @@ export function listFailed(db: Db): FailedJob[] {
       `SELECT order_id, attempts, rate_limit_hits, reconcile_requeues, last_error, updated_at
        FROM jobs WHERE status = 'dead' ORDER BY updated_at, id`,
     )
-    .all() as FailedJob[];
+    .all() as unknown as FailedJob[];
 }
 
 export type ReplayResult = 'replayed' | 'not_found' | 'already_shipped' | 'not_parked';
@@ -167,7 +169,7 @@ export type ReplayResult = 'replayed' | 'not_found' | 'already_shipped' | 'not_p
  * the worker or reconciliation is handling. Safe because the worker checks the courier first.
  */
 export function replayJob(db: Db, orderId: string, now: number): ReplayResult {
-  return db.transaction((): ReplayResult => {
+  return transaction(db, (): ReplayResult => {
     const changed = db
       .prepare(
         `UPDATE jobs SET status = 'queued', attempts = 0, rate_limit_hits = 0, reconcile_requeues = 0,
@@ -182,7 +184,7 @@ export function replayJob(db: Db, orderId: string, now: number): ReplayResult {
     const job = getJob(db, orderId);
     if (!job) return 'not_found';
     return job.status === 'done' ? 'already_shipped' : 'not_parked';
-  })();
+  });
 }
 
 /**
@@ -194,14 +196,14 @@ export function adoptShipment(
   db: Db,
   input: { orderId: string; shipmentId: string; duplicates: number; now: number },
 ): boolean {
-  return db.transaction((): boolean => {
+  return transaction(db, (): boolean => {
     const changed = db
       .prepare(
         `UPDATE jobs SET status = 'done', locked_until = NULL, updated_at = @now
          WHERE order_id = @orderId AND status != 'done'
            AND NOT (status = 'in_progress' AND locked_until > @now)`,
       )
-      .run(input).changes;
+      .run({ orderId: input.orderId, now: input.now }).changes;
     if (changed === 0) return false;
     db.prepare(
       `UPDATE orders SET status = 'shipped', shipment_id = @shipmentId, duplicate_shipments = @duplicates,
@@ -209,7 +211,7 @@ export function adoptShipment(
        WHERE order_id = @orderId`,
     ).run(input);
     return true;
-  })();
+  });
 }
 
 /**
@@ -217,7 +219,7 @@ export function adoptShipment(
  * reconcile_requeues counter (which caps how often this can happen). Only if still 'dead'.
  */
 export function requeueParked(db: Db, orderId: string, now: number): boolean {
-  return db.transaction((): boolean => {
+  return transaction(db, (): boolean => {
     const changed = db
       .prepare(
         `UPDATE jobs SET status = 'queued', attempts = 0, rate_limit_hits = 0,
@@ -228,7 +230,7 @@ export function requeueParked(db: Db, orderId: string, now: number): boolean {
     if (changed === 0) return false;
     db.prepare(`UPDATE orders SET status = 'pending', updated_at = ? WHERE order_id = ?`).run(now, orderId);
     return true;
-  })();
+  });
 }
 
 export function getOrder(db: Db, orderId: string): OrderRow | undefined {

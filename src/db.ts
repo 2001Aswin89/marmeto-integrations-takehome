@@ -1,6 +1,8 @@
-import Database from 'better-sqlite3';
+// Node's built-in SQLite (node:sqlite, Node >= 22.13): synchronous, real transactions, RETURNING,
+// and no native module to compile, so `npm install` works on any machine without build tools.
+import { DatabaseSync } from 'node:sqlite';
 
-export type Db = Database.Database;
+export type Db = DatabaseSync;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS webhook_events (
@@ -38,10 +40,29 @@ CREATE INDEX IF NOT EXISTS idx_jobs_ready ON jobs(status, run_at);
 
 /** Opens (or creates) the database and applies the schema. Use ':memory:' in tests. */
 export function openDb(path: string): Db {
-  const db = new Database(path);
-  db.pragma('journal_mode = WAL'); // readers don't block the writer
-  db.pragma('foreign_keys = ON');
-  db.pragma('busy_timeout = 5000'); // service, reconcile and replay are separate processes
+  const db = new DatabaseSync(path);
+  db.exec(`
+    PRAGMA journal_mode = WAL;    -- readers don't block the writer
+    PRAGMA foreign_keys = ON;
+    PRAGMA busy_timeout = 5000;   -- service, reconcile and replay are separate processes
+  `);
   db.exec(SCHEMA);
   return db;
+}
+
+/**
+ * Runs fn in one transaction: all of it commits, or none of it does.
+ * BEGIN IMMEDIATE takes the write lock up front, so a concurrent writer waits (busy_timeout)
+ * instead of failing halfway through.
+ */
+export function transaction<T>(db: Db, fn: () => T): T {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = fn();
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
 }
