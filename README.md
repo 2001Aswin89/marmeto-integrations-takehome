@@ -297,4 +297,10 @@ Built with Claude Code as a pair programmer. I made the design decisions, review
 
 ## Time spent
 
-The build, from first commit to the end of reconciliation, took about 30 minutes of pairing (see the commit timestamps). The README and final checks took a further 30 minutes or so. Planning the design and reviewing the plan before the first commit are not included in those numbers.
+**About 2.5 hours in total.**
+
+- **Understanding the brief and drafting a plan: about 30 minutes.** Working through the failure modes (duplicate webhooks, a courier that times out after creating) and choosing an approach.
+- **Reviewing and refining the plan: about 30 minutes.** Checking the plan against the brief, settling the open decisions (reconciliation policy, queue choice, AI disclosure), and setting up the repo and branch workflow.
+- **Building: about 40 minutes.** All ten steps, each on its own feature branch with tests, pair-programming with Claude Code (the commit timestamps show the pace).
+- **Verifying and fixing: about 20 minutes.** A fresh-clone check, which led to the switch to `node:sqlite`; a re-check against the brief; and real Ctrl+C testing on Windows, which led to the graceful-shutdown fix.
+- **Final review: about 30 minutes.** Reading through the code and README end to end, and running the demos.
