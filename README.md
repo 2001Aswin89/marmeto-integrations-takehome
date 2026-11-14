@@ -44,10 +44,12 @@ The service log then shows the worker checking the courier, then creating (or re
 ```
 [courier] [mock-courier] GET /shipments ref=1794602304256 -> 200 (0 found)
 [courier] [mock-courier] POST /shipments ref=1794602304256 -> 201 (created shp_1)
-[service] {"level":"info","msg":"shipment.created","orderId":"1794602304256","shipmentId":"shp_1",...}
+[service] {"time":"…","level":"info","msg":"shipment.created","orderId":"1794602304256","shipmentId":"shp_1","attempts":0}
 ```
 
 Check an order with `curl http://localhost:3000/orders/<orderId>`. `send-webhook` takes `--order <id>`, `--once`, and `--bad-signature` (shows the 401).
+
+**Stopping:** press Ctrl+C once. The service stops accepting webhooks, lets the in-flight courier call finish (at most one timeout), records its outcome, releases the job's lease, and closes the DB. A second Ctrl+C more than a second later forces the exit, and the job's lease then expires and is recovered on the next start. On Windows, `cmd` may then ask `Terminate batch job (Y/N)?`. The service has already stopped by then, so either answer is fine.
 
 ### The same with curl
 
@@ -180,6 +182,15 @@ Only one code path creates shipments: the worker, which always checks first. Eve
 - An order ID that is a number above 2^53 is rejected with 400. `JSON.parse` has already rounded it, and silently keying the wrong order is worse than refusing it.
 - SQLite runs with WAL and `busy_timeout`, because the service, `reconcile` and `replay` are separate processes sharing one file.
 - The worker runs in the service's process for simplicity, but only shares the DB, so it can move to its own process unchanged.
+- Graceful shutdown ignores repeats of the same Ctrl+C that arrive within a second. On macOS and Linux, the terminal signals every process in the group, and `concurrently` forwards the same SIGINT again (plus a SIGTERM once the mock exits). Treating those echoes as "force quit" would kill the in-flight job.
+
+## Known limitations
+
+- **The remaining courier race** (design decision 3): only a courier-side idempotency key closes it.
+- **One worker, one job at a time.** Throughput is bounded by courier latency (worst case two 5s timeouts per attempt).
+- **The retry window with the defaults is short:** 5 attempts at 1s, 2s, 4s and 8s, so a job is parked after about 15s of continuous 5xx. That's fine for the demo, and reconciliation requeues it up to 3 more times. In production I'd raise `MAX_ATTEMPTS` or the backoff cap.
+- **The 429 pause is in memory**, so it would need to be shared once there are several workers.
+- **The mock courier keeps its shipments in memory.** Restarting the mock forgets them.
 
 ---
 
@@ -206,11 +217,11 @@ The invariant is that an order is `shipped` exactly when its job is `done` (alwa
 ## Tests
 
 ```bash
-npm test          # 61 tests, ~5s, Node's built-in test runner; mock courier runs in-process on a random port
+npm test          # 65 tests, ~5s, Node's built-in test runner; mock courier runs in-process on a random port
 npm run typecheck
 ```
 
-The worker is driven one job at a time with an injected clock, so no test waits for a real backoff or `Retry-After`. The only real waits are small HTTP timeouts (200ms against a 600ms hang).
+The worker is driven one job at a time with an injected clock, so no test waits for a real backoff or `Retry-After`. The only real waits are small HTTP timeouts (500ms against a 2s hang).
 
 | Test | Protects against |
 |---|---|
@@ -227,6 +238,9 @@ The worker is driven one job at a time with an injected clock, so no test waits 
 | T11 failed GET | a failed check falling through to a POST |
 | T12 leases | a crashed worker's job being stuck forever, or a poison job looping; a crash after POST creating a duplicate |
 | T14 courier client | HTTP status → error type mapping, timeouts, network errors |
+| Shutdown | Ctrl+C abandoning the in-flight job or leaving it leased; an echoed signal force-quitting |
+
+Graceful shutdown was also checked by hand on Windows, with a real console Ctrl+C sent while a courier POST was hanging. It ran under `npm run service` (waits for the timeout, records it, exits 0) and under `npm run demo:hang` through `concurrently`. Two Ctrl+C presses 100ms apart stay graceful, and a second one 1.5s later forces the exit. The macOS/Linux double-signal case is covered by the unit test, not by a run on those systems.
 
 ---
 
@@ -261,7 +275,8 @@ The worker is driven one job at a time with an injected clock, so no test waits 
 
 ```
 mock-courier.js          the mock courier (required name), importable for tests
-src/server.ts            entry: HTTP server + worker + graceful shutdown
+src/server.ts            entry: HTTP server + worker
+src/shutdown.ts          graceful shutdown (in-flight job first, echoed signals ignored)
 src/app.ts               createApp() (no global body parser)
 src/http/webhook.ts      POST /webhooks/orders-create
 src/http/orders.ts       GET /orders/:orderId

@@ -15,7 +15,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     ...loadConfig({}),
     webhookSecret: TEST_SECRET,
     dbPath: ':memory:',
-    courierTimeoutMs: 200,
+    courierTimeoutMs: 500,
     leaseMs: 60_000,
     ...overrides,
   };
@@ -58,7 +58,7 @@ export function fakeClock(start = Date.parse('2026-11-13T10:00:00Z')) {
 
 /**
  * Mock courier + in-memory DB + fake clock + worker deps, with one helper to enqueue an order.
- * The courier timeout is a small real timeout (200ms); the mock's hang is 600ms.
+ * The courier timeout is a small real timeout (500ms); the mock's hang is 2s.
  */
 export async function workerHarness(
   mockOptions: MockOptions = {},
@@ -68,7 +68,7 @@ export async function workerHarness(
   const { createCourierClient } = await import('../src/courier.js');
   const { ingestWebhook } = await import('../src/repo.js');
 
-  const courierMock = await startMock({ hangMs: 600, ...mockOptions });
+  const courierMock = await startMock({ hangMs: 2000, ...mockOptions });
   const db = openDb(':memory:');
   const clock = fakeClock();
   const config = testConfig({ courierBaseUrl: courierMock.url, ...configOverrides });
