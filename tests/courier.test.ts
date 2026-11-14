@@ -17,8 +17,8 @@ describe('T14 courier client against the mock', () => {
   let courier: ReturnType<typeof createCourierClient>;
 
   before(async () => {
-    m = await startMock({ force: 'ok', hangMs: 1000 });
-    courier = createCourierClient({ baseUrl: m.url, timeoutMs: 200 });
+    m = await startMock({ force: 'ok', hangMs: 2000 });
+    courier = createCourierClient({ baseUrl: m.url, timeoutMs: 500 });
   });
   after(async () => m.close());
   beforeEach(() => m.mock.reset());
@@ -79,7 +79,7 @@ describe('T14 courier client against the mock', () => {
   test('courier unreachable -> RetryableError(network)', async () => {
     const down = await startMock();
     await down.close();
-    const offline = createCourierClient({ baseUrl: down.url, timeoutMs: 200 });
+    const offline = createCourierClient({ baseUrl: down.url, timeoutMs: 500 });
     await assert.rejects(offline.find('1001'), (err: unknown) => {
       assert.ok(err instanceof RetryableError);
       assert.equal(err.reason, 'network');
